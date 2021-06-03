@@ -1,0 +1,87 @@
+---
+- name:
+  hosts: localhost
+  connection: local
+  gather_facts: no
+
+  tasks:
+    - name: Find EC2 Facts
+      ec2_instance_info:
+        filters: 
+          "tag:Name": builder
+          "instance-state-name": running
+      register: ec2_facts
+
+    - name: Wait for SSH to come up
+      wait_for: 
+        host: "{{ item.public_ip_address }}" 
+        port: 22 
+        state: started
+      loop: "{{ ec2_facts.instances }}"
+
+    # - debug:
+    #     msg: "{{ item.public_ip_address }}"
+    #   with_items: "{{ ec2_facts.instances }}"
+
+    - name: Create host group
+      add_host: 
+        hostname: "{{ item.public_ip_address }}"
+        groupname: "builder"
+      loop: "{{ ec2_facts.instances }}"
+
+- name: Create Docker in AWS instance 
+  hosts: builder
+  become: yes
+  gather_facts: no
+
+  tasks:
+    - name: Packages install
+      apt:
+        name: "{{ item }}"
+        state: present
+        update_cache: yes
+        force_apt_get: yes
+        cache_valid_time: "3600"
+      loop:
+        - python3-pip
+        - awscli
+        - docker.io
+
+    - name: Install docker python package
+      pip:
+        name: 
+          - docker
+    
+    - name: Get sourse code from git
+      git:
+        repo: 'http://gitlab.6ax.su/6ax/terraform-ansible-aws.git'
+        dest: /tmp/build_dir
+        clone: yes
+        update: yes
+
+    - name: Copy awscli credentials to instance
+      copy:
+        src: ~/.aws
+        dest: ~/
+        mode: "0644"
+    
+    - name: Do ECR login
+      shell: "$(aws ecr get-login --no-include-email --region {{ aws_region }})"
+
+    - name: Get Docker Repository Url for app
+      shell: "aws ecr describe-repositories | awk '/repositoryUri/ && /{{ app_name }}/ { gsub(/\"|,/,\"\"); print $2 }'"
+      register: repo_url
+
+    # - debug:
+    #     msg: "{{ item }}"
+    #   loop: "{{ repo_url.stdout_lines }}"
+
+    - name: Build and push Docker image to registry
+      docker_image:
+        name: "{{ repo_url.stdout }}"
+        source: build
+        build:
+          path: /tmp/build_dir/docker_multi-stage
+          pull: yes 
+        state: present
+        push: yes
